@@ -1769,6 +1769,21 @@ body::before {
     </div>
 
     <!-- Cards das provas (serão preenchidos pelo JS) -->
+    <!-- Resume banner -->
+    <div id="resumeBanner" style="display:none;margin-bottom:18px;padding:16px 20px;
+      background:linear-gradient(135deg,rgba(26,35,126,0.15),rgba(255,213,79,0.08));
+      border:1px solid var(--gold-dim);border-radius:var(--radius-md);
+      align-items:center;gap:16px;flex-wrap:wrap">
+      <div style="font-size:1.6rem;flex-shrink:0">⏸️</div>
+      <div style="flex:1;min-width:180px">
+        <div style="font-weight:700;font-size:0.9rem;color:var(--gold)" id="resumeTitle">Simulado em andamento</div>
+        <div style="font-size:0.8rem;color:var(--text-secondary);margin-top:2px" id="resumeDetail"></div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn btn-primary btn-sm" onclick="resumeExam()">▶ Continuar</button>
+        <button class="btn btn-ghost btn-sm" onclick="discardExam()">✕ Descartar</button>
+      </div>
+    </div>
     <div class="card-grid" id="examGrid">
       <!-- Exam cards gerados por JS -->
       <div class="exam-card skeleton" style="min-height:180px"></div>
@@ -2345,6 +2360,15 @@ const pageRendered = {};
 
 function showPage(pageId) {
   try {
+    // Save quiz progress whenever user navigates away from quiz
+    if (STATE.currentPage === 'quiz' && pageId !== 'quiz' && QS.examId && !QS.reviewMode) {
+      clearInterval(QS.timerInterval); // pause timer
+      saveQuizState();
+    }
+    // Refresh resume banner when returning to simulados
+    if (pageId === 'simulados') {
+      pageRendered['simulados'] = false; // always re-check banner
+    }
     STATE.currentPage = pageId;
     document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
     const target = document.getElementById('page-' + pageId);
@@ -2363,7 +2387,11 @@ function _onPageEnter(pageId) {
     if (pageRendered[pageId]) return;
     pageRendered[pageId] = true;
     switch(pageId) {
-      case 'simulados':  renderExamCards();  break;
+      case 'simulados':
+        renderExamCards();
+        // Show resume banner if there's a paused exam
+        setTimeout(updateResumeBanner, 50);
+        break;
       case 'temas':      renderThemeCards(); break;
       case 'desempenho':
         renderStats();
@@ -3830,6 +3858,12 @@ function init() {
     const badge = document.getElementById('badge-revisao');
     if(badge) { badge.textContent = count; badge.style.display = count>0?'flex':'none'; }
     updateIACards();
+    // Save quiz state before tab closes / page unloads
+    window.addEventListener('beforeunload', () => {
+      if (QS.examId && !QS.reviewMode) saveQuizState();
+    });
+    // Also check if we have a saved quiz on startup
+    if (hasActiveQuiz()) updateResumeBanner();
   } catch(e) { console.error('init error:', e); }
 }
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
@@ -4931,23 +4965,81 @@ var DISC_COLORS = {
 };
 
 // ── ENTRY POINT ────────────────────────────────────────────────
-window.startExam = function(examId, opts) {
+// ── Quiz State Persistence ─────────────────────────────────────
+const QUIZ_LS_KEY = 'medres_quiz_state';
+
+function saveQuizState() {
   try {
-    if (typeof DB === 'undefined' || !DB[examId] || !DB[examId].length) {
-      showToast('❌ Questões não encontradas para esta prova', 'error');
+    if (!QS.examId || QS.reviewMode) { clearQuizState(); return; }
+    // Flags is a Set — serialize to array
+    const state = {
+      examId:    QS.examId,
+      examName:  QS.examName,
+      questions: QS.questions,
+      current:   QS.current,
+      answers:   QS.answers,
+      flags:     [...QS.flags],
+      elapsed:   QS.elapsed,
+      savedAt:   Date.now(),
+    };
+    lsSet(QUIZ_LS_KEY, state);
+  } catch(e) {}
+}
+
+function loadQuizState() {
+  try { return lsGet(QUIZ_LS_KEY, null); } catch(e) { return null; }
+}
+
+function clearQuizState() {
+  try { localStorage.removeItem(QUIZ_LS_KEY); } catch(e) {}
+}
+
+function hasActiveQuiz() {
+  const s = loadQuizState();
+  if (!s || !s.examId || !s.questions?.length) return false;
+  // Expire after 12h (user probably forgot)
+  if (Date.now() - (s.savedAt||0) > 43200000) { clearQuizState(); return false; }
+  return true;
+}
+
+function updateResumeBanner() {
+  try {
+    const banner = document.getElementById('resumeBanner');
+    if (!banner) return;
+    if (!hasActiveQuiz()) {
+      banner.style.display = 'none';
       return;
     }
-    const meta = EXAM_META.find(e => e.id === examId);
-    QS.examId    = examId;
-    QS.examName  = meta ? meta.name : examId;
-    QS.questions = (opts && opts.subset) ? opts.subset : DB[examId].slice();
-    QS.current   = 0;
-    QS.answers   = {};
-    QS.flags     = new Set();
+    const s = loadQuizState();
+    const answered = Object.keys(s.answers||{}).length;
+    const elapsed  = s.elapsed || 0;
+    const mins     = Math.floor(elapsed/60), secs = elapsed%60;
+    const timeStr  = elapsed > 0 ? ` · ${mins}:${String(secs).padStart(2,'0')} decorridos` : '';
+    const title = document.getElementById('resumeTitle');
+    const detail = document.getElementById('resumeDetail');
+    if (title)  title.textContent  = `⏸️ ${s.examName || s.examId} em andamento`;
+    if (detail) detail.textContent =
+      `Questão ${(s.current||0)+1} de ${s.questions.length} · ${answered} respondida${answered!==1?'s':''}${timeStr}`;
+    banner.style.display = 'flex';
+  } catch(e) {}
+}
+
+function resumeExam() {
+  try {
+    const s = loadQuizState();
+    if (!s || !s.questions?.length) { showToast('Nenhum simulado salvo', 'error'); return; }
+
+    QS.examId     = s.examId;
+    QS.examName   = s.examName;
+    QS.questions  = s.questions;
+    QS.current    = s.current || 0;
+    QS.answers    = s.answers || {};
+    QS.flags      = new Set(s.flags || []);
+    QS.elapsed    = s.elapsed || 0;
     QS.reviewMode = false;
     QS.wrongIndices = [];
-    QS.startTime = Date.now();
-    QS.elapsed   = 0;
+    // Adjust startTime so the clock continues from elapsed
+    QS.startTime  = Date.now() - (QS.elapsed * 1000);
     clearInterval(QS.timerInterval);
 
     ensureQuizPage();
@@ -4957,8 +5049,105 @@ window.startExam = function(examId, opts) {
     renderNavGrid();
     renderQuestion();
     startTimer();
+    showToast('▶ Simulado retomado!', 'success');
+  } catch(e) { console.error('resumeExam:', e); }
+}
+
+function discardExam() {
+  showConfirm(
+    'Descartar simulado?',
+    'O progresso atual será perdido permanentemente.',
+    () => {
+      clearQuizState();
+      clearInterval(QS.timerInterval);
+      QS.examId = null;
+      updateResumeBanner();
+      showToast('🗑️ Simulado descartado', 'info');
+    }
+  );
+}
+
+// ── Start Exam (with in-progress guard) ────────────────────────
+window.startExam = function(examId, opts) {
+  try {
+    if (typeof DB === 'undefined' || !DB[examId] || !DB[examId].length) {
+      showToast('❌ Questões não encontradas para esta prova', 'error');
+      return;
+    }
+
+    // If there's a different exam in progress, ask before overwriting
+    if (hasActiveQuiz()) {
+      const saved = loadQuizState();
+      if (saved.examId !== examId) {
+        showConfirm(
+          'Iniciar nova prova?',
+          `Você tem "${saved.examName||saved.examId}" em andamento com ${Object.keys(saved.answers||{}).length} respostas salvas. Iniciar esta nova prova irá descartar o progresso anterior.`,
+          () => _doStartExam(examId, opts)
+        );
+        return;
+      }
+      // Same exam: ask to resume or restart
+      showConfirm(
+        'Retomar ou reiniciar?',
+        `Você tem este simulado em andamento (Q${(saved.current||0)+1}/${saved.questions.length}, ${Object.keys(saved.answers||{}).length} respondidas). Clique OK para reiniciar do zero.`,
+        () => _doStartExam(examId, opts)
+      );
+      // Add "Resume" option to confirmOkBtn context — override the modal temporarily
+      const okBtn = document.getElementById('confirmOkBtn');
+      if (okBtn) {
+        const originalText = okBtn.textContent;
+        okBtn.textContent = 'Reiniciar';
+        // Add resume button sibling
+        const resumeBtn = document.createElement('button');
+        resumeBtn.className = 'btn btn-primary btn-sm';
+        resumeBtn.textContent = '▶ Continuar de onde parei';
+        resumeBtn.style.marginRight = '8px';
+        resumeBtn.onclick = () => { closeModal('confirmOverlay'); resumeExam(); };
+        okBtn.parentNode.insertBefore(resumeBtn, okBtn);
+        // Cleanup when modal closes
+        const cleanup = () => {
+          if (resumeBtn.parentNode) resumeBtn.remove();
+          okBtn.textContent = originalText;
+        };
+        okBtn.addEventListener('click', cleanup, { once: true });
+        document.getElementById('confirmOverlay').addEventListener(
+          'click', e => { if(e.target.id==='confirmOverlay') cleanup(); }, { once: true }
+        );
+      }
+      return;
+    }
+
+    _doStartExam(examId, opts);
   } catch(e) { console.error('startExam:', e); showToast('Erro ao iniciar simulado', 'error'); }
 };
+
+function _doStartExam(examId, opts) {
+  try {
+    clearQuizState(); // clear any existing save
+    const meta = EXAM_META.find(e => e.id === examId);
+    QS.examId     = examId;
+    QS.examName   = meta ? meta.name : examId;
+    QS.questions  = (opts && opts.subset) ? opts.subset : DB[examId].slice();
+    QS.current    = 0;
+    QS.answers    = {};
+    QS.flags      = new Set();
+    QS.reviewMode = false;
+    QS.wrongIndices = [];
+    QS.startTime  = Date.now();
+    QS.elapsed    = 0;
+    clearInterval(QS.timerInterval);
+
+    ensureQuizPage();
+    ensureResultsPage();
+    showPage('quiz');
+    renderQuizHeader();
+    renderNavGrid();
+    renderQuestion();
+    startTimer();
+    // Save initial state immediately
+    saveQuizState();
+  } catch(e) { console.error('_doStartExam:', e); }
+}
 
 // Alias for theme cards / IA buttons
 window.initExam = window.startExam;
@@ -5025,10 +5214,12 @@ function startTimer() {
       const rem = Math.max(0, limitSec - QS.elapsed);
       clock.textContent = fmtTime(rem);
       clock.classList.toggle('warning', rem < 300 && rem > 0);
-      if (rem === 0) { clearInterval(QS.timerInterval); finishExam(); }
+      if (rem === 0) { clearInterval(QS.timerInterval); finishExam(); return; }
     } else {
       clock.textContent = fmtTime(QS.elapsed);
     }
+    // Auto-save every 30 seconds
+    if (QS.elapsed % 30 === 0 && QS.elapsed > 0) saveQuizState();
   }
   tick();
   QS.timerInterval = setInterval(tick, 1000);
@@ -5128,7 +5319,11 @@ function renderQuestion() {
 // ── INTERACTIONS ───────────────────────────────────────────────
 function selectOption(oi) {
   if (QS.reviewMode) return;
-  try { QS.answers[QS.current] = oi; renderQuestion(); } catch(e) {}
+  try {
+    QS.answers[QS.current] = oi;
+    renderQuestion();
+    saveQuizState(); // persist every answer
+  } catch(e) {}
 }
 function navigate(dir) {
   try {
@@ -5142,6 +5337,7 @@ function goTo(idx) {
     renderQuestion();
     const card = document.querySelector('.q-card');
     if (card) card.scrollIntoView({behavior:'smooth', block:'nearest'});
+    saveQuizState(); // persist navigation position
   } catch(e) {}
 }
 function toggleFlag() {
@@ -5149,16 +5345,62 @@ function toggleFlag() {
     if (QS.flags.has(QS.current)) QS.flags.delete(QS.current);
     else QS.flags.add(QS.current);
     renderQuestion();
+    saveQuizState();
   } catch(e) {}
 }
 
 // ── CONFIRM DIALOGS ────────────────────────────────────────────
 function confirmExitQuiz() {
-  if (QS.reviewMode) { showPage('simulados'); pageRendered['simulados']=false; _onPageEnter('simulados'); return; }
+  if (QS.reviewMode) {
+    clearQuizState();
+    showPage('simulados');
+    pageRendered['simulados'] = false;
+    _onPageEnter('simulados');
+    return;
+  }
   const answered = Object.keys(QS.answers).length;
-  showConfirm('Sair do Simulado?',
-    `Você respondeu ${answered} de ${QS.questions.length} questões. O progresso NÃO será salvo.`,
-    () => { clearInterval(QS.timerInterval); showPage('simulados'); pageRendered['simulados']=false; _onPageEnter('simulados'); });
+  // Save current progress before showing dialog (so timer-pause state is preserved)
+  saveQuizState();
+  showConfirm(
+    'Pausar ou sair do simulado?',
+    `${answered} de ${QS.questions.length} respondidas. O progresso está SALVO automaticamente. Você pode retomar depois.`,
+    () => {
+      // User clicked OK = sair e descartar
+      clearQuizState();
+      clearInterval(QS.timerInterval);
+      QS.examId = null;
+      showPage('simulados');
+      pageRendered['simulados'] = false;
+      _onPageEnter('simulados');
+    }
+  );
+  // Change OK button label to make it clearer
+  const okBtn = document.getElementById('confirmOkBtn');
+  if (okBtn) okBtn.textContent = 'Sair e descartar';
+  // Add "Pause" button
+  const pauseBtn = document.createElement('button');
+  pauseBtn.className = 'btn btn-primary btn-sm';
+  pauseBtn.textContent = '⏸ Pausar (salvo)';
+  pauseBtn.style.marginRight = '8px';
+  pauseBtn.onclick = () => {
+    closeModal('confirmOverlay');
+    clearInterval(QS.timerInterval);
+    showPage('simulados');
+    pageRendered['simulados'] = false;
+    _onPageEnter('simulados');
+  };
+  const cancelBtn = document.getElementById('confirmOkBtn');
+  if (cancelBtn && cancelBtn.parentNode) {
+    cancelBtn.parentNode.insertBefore(pauseBtn, cancelBtn);
+    // Cleanup
+    const cleanup = () => {
+      if (pauseBtn.parentNode) pauseBtn.remove();
+      if (cancelBtn) cancelBtn.textContent = 'OK';
+    };
+    cancelBtn.addEventListener('click', cleanup, {once:true});
+    document.getElementById('confirmOverlay')?.addEventListener(
+      'click', e => { if(e.target.id==='confirmOverlay') cleanup(); }, {once:true});
+  }
 }
 function confirmFinish() {
   const answered = Object.keys(QS.answers).length;
@@ -5174,6 +5416,7 @@ function confirmFinish() {
 function finishExam() {
   try {
     clearInterval(QS.timerInterval);
+    clearQuizState(); // exam done — remove saved progress
     QS.reviewMode = true;
     const qs = QS.questions;
     let correct = 0;
