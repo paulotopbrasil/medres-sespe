@@ -2935,7 +2935,6 @@ function openThemePage(idx) {
     if (!t) return;
 
     // Count practice questions available
-    const kws     = THEME_KEYWORDS[idx] || [];
     const practiceQs = getPracticeQuestionsForTheme(idx);
 
     // Build detail content
@@ -3029,41 +3028,55 @@ function toggleTemaSection(header) {
 function getPracticeQuestionsForTheme(idx) {
   try {
     if (typeof DB === 'undefined') return [];
-    // Use explicit temas field (precise tag-based filtering)
-    const all = Object.values(DB).flat();
-    const tagged = all.filter(q => Array.isArray(q.temas) && q.temas.includes(idx));
-    // Fallback to keyword search only if no tagged questions found
-    if (tagged.length > 0) return tagged;
-    const kws = THEME_KEYWORDS[idx] || [];
-    return all.filter(q => {
-      const text = ((q.enunciado||'') + ' ' + (q.opcoes||[]).join(' ')).toLowerCase();
-      return kws.some(kw => text.includes(kw.toLowerCase()));
-    });
-  } catch(e) { return []; }
+    // Filtra APENAS pelo campo temas — sem fallback por palavras-chave
+    // Exclui questões de simulados sintéticos (tema_N) para evitar recursão
+    const all = Object.entries(DB)
+      .filter(([id]) => !id.startsWith('tema_'))
+      .flatMap(([, qs]) => qs);
+    return all.filter(q => Array.isArray(q.temas) && q.temas.includes(idx));
+  } catch(e) { console.error('getPracticeQuestionsForTheme:', e); return []; }
 }
+
+// Guarda o subset fixo de cada tema enquanto a sessão estiver ativa
+const TEMA_ACTIVE_SUBSET = {};
 
 function startThemePractice(idx) {
   try {
     const qs = getPracticeQuestionsForTheme(idx);
-    if (!qs.length) { showToast('Nenhuma questão encontrada para este tema', 'error'); return; }
+    if (!qs.length) {
+      showToast('Nenhuma questão disponível para este tema', 'error');
+      return;
+    }
 
-    // Shuffle
-    const shuffled = qs.slice().sort(() => Math.random()-0.5).slice(0, 40);
+    // Reutiliza o subset existente se já houver um para este tema
+    // Isso garante que sair e voltar não muda as questões
+    if (!TEMA_ACTIVE_SUBSET[idx]) {
+      TEMA_ACTIVE_SUBSET[idx] = qs.slice().sort(() => Math.random() - 0.5).slice(0, 40);
+    }
+    const subset = TEMA_ACTIVE_SUBSET[idx];
 
-    // Use the quiz engine with a synthetic examId
     const syntheticId = 'tema_' + idx;
-    if (!DB[syntheticId]) DB[syntheticId] = shuffled;
+    DB[syntheticId] = subset;
 
-    // Set exam name for display
-    const meta = EXAM_META.find(e => e.id === syntheticId);
-    if (!meta) {
-      EXAM_META.push({ id: syntheticId, name: `Prática: ${TEMAS[idx].name}`, year:'', edition:'', color:'#a78bfa' });
+    const existingMeta = EXAM_META.find(e => e.id === syntheticId);
+    if (!existingMeta) {
+      EXAM_META.push({
+        id: syntheticId,
+        name: `Prática: ${TEMAS[idx].name}`,
+        year: '', edition: '', color: '#a78bfa'
+      });
     }
 
-    if (typeof window.startExam === 'function') {
-      window.startExam(syntheticId, { subset: shuffled });
-    }
+    // Bypassa o guard hasActiveQuiz — prática de tema sempre começa limpa
+    clearQuizState();
+    _doStartExam(syntheticId, { subset });
   } catch(e) { console.error('startThemePractice:', e); }
+}
+
+// Limpa o subset de um tema (chamado quando o usuário finaliza ou descarta)
+function clearTemaSubset(idx) {
+  if (idx !== undefined) delete TEMA_ACTIVE_SUBSET[idx];
+  else Object.keys(TEMA_ACTIVE_SUBSET).forEach(k => delete TEMA_ACTIVE_SUBSET[k]);
 }
 
 // ── STATS ──────────────────────────────────────────────────────
@@ -4997,19 +5010,30 @@ const QUIZ_LS_KEY = 'medres_quiz_state';
 function saveQuizState() {
   try {
     if (!QS.examId || QS.reviewMode) { clearQuizState(); return; }
-    // Flags is a Set — serialize to array
+
+    // Salva referência LEVE — não serializa as questões completas
+    // (questões podem ter imgB64 de 25KB+ que explodiria o localStorage)
+    // Na retomada, as questões são recarregadas de DB[examId]
     const state = {
-      examId:    QS.examId,
-      examName:  QS.examName,
-      questions: QS.questions,
-      current:   QS.current,
-      answers:   QS.answers,
-      flags:     [...QS.flags],
-      elapsed:   QS.elapsed,
-      savedAt:   Date.now(),
+      examId:   QS.examId,
+      examName: QS.examName,
+      current:  QS.current,
+      answers:  QS.answers,
+      flags:    [...QS.flags],
+      elapsed:  QS.elapsed,
+      savedAt:  Date.now(),
+      // Para práticas de tema (synthetic exams), salva os índices das questões
+      // para poder reconstruir o subset correto
+      questionNums: QS.questions.map(q => q.num),
     };
-    lsSet(QUIZ_LS_KEY, state);
-  } catch(e) {}
+
+    // Tenta salvar; se falhar (quota), loga e mantém em memória
+    try {
+      localStorage.setItem(QUIZ_LS_KEY, JSON.stringify(state));
+    } catch(quotaErr) {
+      console.warn('saveQuizState: localStorage quota exceeded, keeping state in memory only');
+    }
+  } catch(e) { console.error('saveQuizState:', e); }
 }
 
 function loadQuizState() {
@@ -5021,11 +5045,16 @@ function clearQuizState() {
 }
 
 function hasActiveQuiz() {
-  const s = loadQuizState();
-  if (!s || !s.examId || !s.questions?.length) return false;
-  // Expire after 12h (user probably forgot)
-  if (Date.now() - (s.savedAt||0) > 43200000) { clearQuizState(); return false; }
-  return true;
+  try {
+    const s = loadQuizState();
+    if (!s || !s.examId) return false;
+    // Expira após 12h
+    if (Date.now() - (s.savedAt||0) > 43200000) { clearQuizState(); return false; }
+    // Verifica se o examId ainda existe no DB
+    if (typeof DB === 'undefined') return true; // DB ainda não carregou — manter
+    if (!DB[s.examId]) return false;
+    return true;
+  } catch(e) { return false; }
 }
 
 function updateResumeBanner() {
@@ -5039,32 +5068,62 @@ function updateResumeBanner() {
     const s = loadQuizState();
     const answered = Object.keys(s.answers||{}).length;
     const elapsed  = s.elapsed || 0;
-    const mins     = Math.floor(elapsed/60), secs = elapsed%60;
+    const mins     = Math.floor(elapsed/60), secs = elapsed % 60;
     const timeStr  = elapsed > 0 ? ` · ${mins}:${String(secs).padStart(2,'0')} decorridos` : '';
-    const title = document.getElementById('resumeTitle');
+
+    // Total de questões: usa questionNums (novo formato leve) ou DB[examId]
+    let total = 0;
+    if (s.questionNums?.length) {
+      total = s.questionNums.length;
+    } else if (typeof DB !== 'undefined' && DB[s.examId]) {
+      total = DB[s.examId].length;
+    }
+
+    const title  = document.getElementById('resumeTitle');
     const detail = document.getElementById('resumeDetail');
     if (title)  title.textContent  = `⏸️ ${s.examName || s.examId} em andamento`;
     if (detail) detail.textContent =
-      `Questão ${(s.current||0)+1} de ${s.questions.length} · ${answered} respondida${answered!==1?'s':''}${timeStr}`;
+      `Questão ${(s.current||0)+1}${total ? ' de ' + total : ''} · ` +
+      `${answered} respondida${answered!==1?'s':''}${timeStr}`;
     banner.style.display = 'flex';
-  } catch(e) {}
+  } catch(e) { console.error('updateResumeBanner:', e); }
 }
 
 function resumeExam() {
   try {
     const s = loadQuizState();
-    if (!s || !s.questions?.length) { showToast('Nenhum simulado salvo', 'error'); return; }
+    if (!s || !s.examId) { showToast('Nenhum simulado salvo', 'error'); return; }
+
+    // Reconstruir questions de DB (evita deserializar dados pesados do localStorage)
+    let questions;
+    if (typeof DB !== 'undefined' && DB[s.examId]) {
+      const allQs = DB[s.examId];
+      if (s.questionNums && s.questionNums.length > 0) {
+        // Subset de prática de tema: reconstruir pela ordem salva
+        const numMap = {};
+        allQs.forEach(q => { numMap[q.num] = q; });
+        questions = s.questionNums.map(n => numMap[n]).filter(Boolean);
+      } else {
+        questions = allQs.slice();
+      }
+    }
+
+    if (!questions || !questions.length) {
+      showToast('❌ Não foi possível recuperar as questões do simulado', 'error');
+      clearQuizState();
+      return;
+    }
 
     QS.examId     = s.examId;
     QS.examName   = s.examName;
-    QS.questions  = s.questions;
+    QS.questions  = questions;
     QS.current    = s.current || 0;
     QS.answers    = s.answers || {};
     QS.flags      = new Set(s.flags || []);
     QS.elapsed    = s.elapsed || 0;
     QS.reviewMode = false;
     QS.wrongIndices = [];
-    // Adjust startTime so the clock continues from elapsed
+    // Retoma o cronômetro exatamente de onde parou
     QS.startTime  = Date.now() - (QS.elapsed * 1000);
     clearInterval(QS.timerInterval);
 
@@ -5104,18 +5163,22 @@ window.startExam = function(examId, opts) {
     // If there's a different exam in progress, ask before overwriting
     if (hasActiveQuiz()) {
       const saved = loadQuizState();
+      const savedTotal = saved.questionNums?.length ||
+        (typeof DB !== 'undefined' && DB[saved.examId] ? DB[saved.examId].length : '?');
+      const savedAnswered = Object.keys(saved.answers||{}).length;
+
       if (saved.examId !== examId) {
         showConfirm(
           'Iniciar nova prova?',
-          `Você tem "${saved.examName||saved.examId}" em andamento com ${Object.keys(saved.answers||{}).length} respostas salvas. Iniciar esta nova prova irá descartar o progresso anterior.`,
+          `Você tem "${saved.examName||saved.examId}" em andamento com ${savedAnswered} resposta${savedAnswered!==1?'s':''} salva${savedAnswered!==1?'s':''}. Iniciar esta nova prova irá descartar o progresso anterior.`,
           () => _doStartExam(examId, opts)
         );
         return;
       }
-      // Same exam: ask to resume or restart
+      // Mesmo exam: oferecer retomar ou reiniciar
       showConfirm(
         'Retomar ou reiniciar?',
-        `Você tem este simulado em andamento (Q${(saved.current||0)+1}/${saved.questions.length}, ${Object.keys(saved.answers||{}).length} respondidas). Clique OK para reiniciar do zero.`,
+        `Você tem este simulado em andamento (Q${(saved.current||0)+1}/${savedTotal}, ${savedAnswered} respondida${savedAnswered!==1?'s':''}). Clique OK para reiniciar do zero.`,
         () => _doStartExam(examId, opts)
       );
       // Add "Resume" option to confirmOkBtn context — override the modal temporarily
@@ -5459,6 +5522,11 @@ function finishExam() {
   try {
     clearInterval(QS.timerInterval);
     clearQuizState(); // exam done — remove saved progress
+    // Se era prática de tema, limpa o subset para que a próxima sessão seja nova
+    if (QS.examId && QS.examId.startsWith('tema_')) {
+      const temaIdx = parseInt(QS.examId.replace('tema_', ''));
+      if (!isNaN(temaIdx)) clearTemaSubset(temaIdx);
+    }
     QS.reviewMode = true;
     const qs = QS.questions;
     let correct = 0;
