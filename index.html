@@ -2934,8 +2934,7 @@ function openThemePage(idx) {
     const t = TEMAS[idx];
     if (!t) return;
 
-    // Count practice questions available
-    const practiceQs = getPracticeQuestionsForTheme(idx);
+
 
     // Build detail content
     const content = document.getElementById('themeDetailContent');
@@ -2961,21 +2960,9 @@ function openThemePage(idx) {
           <div class="theme-hero-meta">
             <span class="theme-hero-badge">${t.disc}</span>
             <span class="theme-hero-badge">${t.freq}% das provas</span>
-            <span class="theme-hero-badge">${practiceQs.length} questões para praticar</span>
+  
           </div>
         </div>
-      </div>
-
-      <!-- Practice bar -->
-      <div class="tema-practice-bar">
-        <div class="tema-practice-info">
-          <strong>${practiceQs.length} questões</strong> encontradas para este tema no banco de 700
-        </div>
-        <button class="btn btn-primary"
-          onclick="startThemePractice(${idx})"
-          ${practiceQs.length===0?'disabled':''}>
-          Praticar este tema →
-        </button>
       </div>
 
       <!-- Resumo -->
@@ -3025,59 +3012,8 @@ function toggleTemaSection(header) {
 }
 
 // ── Practice mode ─────────────────────────────────────────────
-function getPracticeQuestionsForTheme(idx) {
-  try {
-    if (typeof DB === 'undefined') return [];
-    // Filtra APENAS pelo campo temas — sem fallback por palavras-chave
-    // Exclui questões de simulados sintéticos (tema_N) para evitar recursão
-    const all = Object.entries(DB)
-      .filter(([id]) => !id.startsWith('tema_'))
-      .flatMap(([, qs]) => qs);
-    return all.filter(q => Array.isArray(q.temas) && q.temas.includes(idx));
-  } catch(e) { console.error('getPracticeQuestionsForTheme:', e); return []; }
-}
 
-// Guarda o subset fixo de cada tema enquanto a sessão estiver ativa
-const TEMA_ACTIVE_SUBSET = {};
 
-function startThemePractice(idx) {
-  try {
-    const qs = getPracticeQuestionsForTheme(idx);
-    if (!qs.length) {
-      showToast('Nenhuma questão disponível para este tema', 'error');
-      return;
-    }
-
-    // Reutiliza o subset existente se já houver um para este tema
-    // Isso garante que sair e voltar não muda as questões
-    if (!TEMA_ACTIVE_SUBSET[idx]) {
-      TEMA_ACTIVE_SUBSET[idx] = qs.slice().sort(() => Math.random() - 0.5).slice(0, 40);
-    }
-    const subset = TEMA_ACTIVE_SUBSET[idx];
-
-    const syntheticId = 'tema_' + idx;
-    DB[syntheticId] = subset;
-
-    const existingMeta = EXAM_META.find(e => e.id === syntheticId);
-    if (!existingMeta) {
-      EXAM_META.push({
-        id: syntheticId,
-        name: `Prática: ${TEMAS[idx].name}`,
-        year: '', edition: '', color: '#a78bfa'
-      });
-    }
-
-    // Bypassa o guard hasActiveQuiz — prática de tema sempre começa limpa
-    clearQuizState();
-    _doStartExam(syntheticId, { subset });
-  } catch(e) { console.error('startThemePractice:', e); }
-}
-
-// Limpa o subset de um tema (chamado quando o usuário finaliza ou descarta)
-function clearTemaSubset(idx) {
-  if (idx !== undefined) delete TEMA_ACTIVE_SUBSET[idx];
-  else Object.keys(TEMA_ACTIVE_SUBSET).forEach(k => delete TEMA_ACTIVE_SUBSET[k]);
-}
 
 // ── STATS ──────────────────────────────────────────────────────
 function renderStats() {
@@ -5522,11 +5458,7 @@ function finishExam() {
   try {
     clearInterval(QS.timerInterval);
     clearQuizState(); // exam done — remove saved progress
-    // Se era prática de tema, limpa o subset para que a próxima sessão seja nova
-    if (QS.examId && QS.examId.startsWith('tema_')) {
-      const temaIdx = parseInt(QS.examId.replace('tema_', ''));
-      if (!isNaN(temaIdx)) clearTemaSubset(temaIdx);
-    }
+
     QS.reviewMode = true;
     const qs = QS.questions;
     let correct = 0;
